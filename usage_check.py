@@ -12,6 +12,7 @@ Python 3.9 以上・標準ライブラリだけで動く。
   python3 usage_check.py report --dest <格納先> [--from 2026-11-01 --to 2026-11-30]
 """
 import argparse
+import csv
 import glob
 import html
 import json
@@ -25,7 +26,7 @@ import tempfile
 from collections import defaultdict
 from datetime import date, datetime
 
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.2.0"
 SCHEMA = 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".claude-usage-check")
@@ -532,7 +533,7 @@ def find_browser():
     return None
 
 
-def cmd_report(a):
+def load_members(a):
     dest = a.dest or (load_json(CONFIG_PATH, {}) or {}).get("dest")
     if not dest:
         die("--dest で格納先を指定してください。")
@@ -557,11 +558,22 @@ def cmd_report(a):
     for v in (a.date_from, a.date_to):
         if v and not DATE_RE.match(v):
             die("期間は YYYY-MM-DD の形で指定してください: " + v)
+    return folder, members
+
+
+def period_stem(a):
+    if a.date_from or a.date_to:
+        return "claude-usage_%s_%s" % (a.date_from or "start", a.date_to or date.today().isoformat())
+    return "claude-usage_%s" % date.today().strftime("%Y%m%d")
+
+
+def cmd_report(a):
+    folder, members = load_members(a)
     s = summarize(members, a.date_from, a.date_to)
     as_of = next(iter(members.values())).get("prices_as_of", "?")
     out_dir = os.path.join(folder, "reports")
     os.makedirs(out_dir, exist_ok=True)
-    stem = "claude-usage_%s" % date.today().strftime("%Y%m%d")
+    stem = period_stem(a)
     html_path = os.path.join(out_dir, stem + ".html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(render_html(a.org, s, a.date_from, a.date_to, as_of))
@@ -587,6 +599,54 @@ def cmd_report(a):
         print("PDF の書き出しに失敗しました。HTML をブラウザで開き「PDF に保存」してください。")
 
 
+def sheet_safe(v):
+    """スプシに貼った時に数式として動かないようにする。"""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
+
+
+def export_rows(members, d_from, d_to):
+    monthly = defaultdict(lambda: defaultdict(float))
+    projects = defaultdict(int)
+    for name, data in members.items():
+        for day, r in data["days"].items():
+            if (d_from and day < d_from) or (d_to and day > d_to):
+                continue
+            m = monthly[(day[:7], name)]
+            m["active_days"] += 1 if r["prompts"] > 0 else 0
+            for k in ("sessions", "prompts", "responses", "cost_usd"):
+                m[k] += r[k]
+            for t in r["models"].values():
+                m["tokens"] += sum(t[k] for k in TOKEN_KEYS if k != "responses")
+            m["updated_at"] = data.get("updated_at", "")[:10]
+            for pj, n in (r.get("projects") or {}).items():
+                projects[(day[:7], name, pj)] += n
+    head_m = ["月", "名前", "使った日数", "セッション", "人の発言", "AIの応答", "トークン", "API換算(USD)", "最終送信日"]
+    rows_m = [[mon, sheet_safe(name), int(v["active_days"]), int(v["sessions"]), int(v["prompts"]),
+               int(v["responses"]), int(v["tokens"]), round(v["cost_usd"], 2), v["updated_at"]]
+              for (mon, name), v in sorted(monthly.items())]
+    head_p = ["月", "名前", "フォルダ", "人の発言"]
+    rows_p = [[mon, sheet_safe(name), sheet_safe(pj), n]
+              for (mon, name, pj), n in sorted(projects.items(), key=lambda x: (x[0][0], x[0][1], -x[1]))]
+    return [head_m] + rows_m, [head_p] + rows_p
+
+
+def cmd_export(a):
+    folder, members = load_members(a)
+    monthly, projects = export_rows(members, a.date_from, a.date_to)
+    if a.json:
+        json.dump({"monthly": monthly, "projects": projects}, sys.stdout, ensure_ascii=False)
+        return
+    out_dir = os.path.join(folder, "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    for name, rows in (("monthly", monthly), ("projects", projects)):
+        path = os.path.join(out_dir, "%s_%s.csv" % (period_stem(a), name))
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            csv.writer(f).writerows(rows)
+        print("CSV: " + path)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Claude Code の使用量を数える")
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -608,6 +668,12 @@ def main():
     p.add_argument("--from", dest="date_from")
     p.add_argument("--to", dest="date_to")
     p.set_defaults(fn=cmd_report)
+    p = sp.add_parser("export", help="月別・フォルダ別の表を CSV（または JSON）で出す")
+    p.add_argument("--dest")
+    p.add_argument("--from", dest="date_from")
+    p.add_argument("--to", dest="date_to")
+    p.add_argument("--json", action="store_true", help="CSV を書かずに標準出力へ JSON で出す")
+    p.set_defaults(fn=cmd_export)
     a = ap.parse_args()
     a.fn(a)
 
