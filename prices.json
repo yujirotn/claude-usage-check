@@ -1,0 +1,20 @@
+{
+  "_note": "Anthropic API の公開単価（USD / 100万トークン）。2026-11-03 時点。cache_write_5m / cache_write_1h は入力単価の 1.25 倍 / 2 倍として置いた目安。定額プラン（Pro / Max / Team）の実際の支払いとは別物で、「API で使ったら何ドル分か」を示すための換算。",
+  "as_of": "2026-11-03",
+  "models": {
+    "claude-fable-5-2":  {"input": 8.0,  "output": 40.0, "cache_read": 0.20},
+    "claude-fable-5-1":  {"input": 10.0, "output": 50.0},
+    "claude-fable-5":    {"input": 10.0, "output": 50.0},
+    "claude-opus-5-5":   {"input": 4.0,  "output": 20.0, "cache_read": 0.20},
+    "claude-opus-5":     {"input": 5.0,  "output": 25.0},
+    "claude-opus-4-8":   {"input": 5.0,  "output": 25.0},
+    "claude-opus-4-7":   {"input": 5.0,  "output": 25.0},
+    "claude-opus-4-6":   {"input": 5.0,  "output": 25.0},
+    "claude-sonnet-5-5": {"input": 2.0,  "output": 10.0, "cache_read": 0.10},
+    "claude-sonnet-5":   {"input": 2.0,  "output": 10.0},
+    "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0},
+    "claude-haiku-5-5":  {"input": 0.10, "output": 0.50},
+    "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0}
+  },
+  "defaults": {"cache_read_ratio": 0.1, "cache_write_5m_ratio": 1.25, "cache_write_1h_ratio": 2.0}
+}
