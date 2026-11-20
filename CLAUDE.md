@@ -18,7 +18,7 @@
 まず、決まった版のリポを手元に用意する（B でも同じ）。
 
 ```bash
-VERSION=v0.3.0
+VERSION=v0.4.0
 R=~/.claude-usage-check/repo
 [ -d "$R/.git" ] || git clone -q https://github.com/yujirotn/claude-usage-check "$R"
 git -C "$R" fetch -q --tags && git -C "$R" checkout -q "$VERSION" && cd "$R" && git describe --tags
@@ -35,7 +35,7 @@ git -C "$R" fetch -q --tags && git -C "$R" checkout -q "$VERSION" && cd "$R" && 
    - `python3 usage_check.py find-drives` で同期フォルダの候補を出す
    - 利用者がフォルダ名だけ知っている場合は、候補の下からその名前のフォルダを探して（`find '<候補>' -maxdepth 4 -type d -name '<名前>'` など）、見つかったパスを見せて「ここで合っていますか」と確かめる
    - 見つからない時は、Google ドライブ（パソコン版）が入っているか、担当者がフォルダを「編集者」で共有したかを確かめてもらう。推測でほかの場所に書かない
-3. **フォルダ別の数**: 担当者の案内に「フォルダ別も」とあれば送る。なければ送らない（既定）。作業フォルダの名前にお客様の社名などが入ることがあると伝える
+3. **フォルダ別の数**: 担当者の案内に「フォルダ別も」とあれば送る。なければ送らない（既定）。作業フォルダの名前にお客様の社名などが入ることがあると伝える。送る設定の時は、呼んだスキル・エージェントの名前もそのまま送られる（送らない設定の時は名前を記号にする）
 
 決まったら実行する:
 

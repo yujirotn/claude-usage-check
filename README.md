@@ -11,7 +11,9 @@
 | 日付ごとのセッション数・人の発言数・AI の応答数 | 会話の中身（プロンプト・返答・ファイル） |
 | モデル別のトークン数と API 換算の金額（目安） | パスワード・API キー・アカウント情報 |
 | 起動元（CLI・IDE など）の回数 | 作業していたファイルの名前 |
-| （担当者が希望した時だけ）作業フォルダ名ごとの発言数 | |
+| スキル・エージェント・MCP・スラッシュコマンドを呼んだ回数 | スキルやファイルの中身 |
+| 入っているスキル・エージェント・プラグインの**数**（名前は送らない） | |
+| （担当者が希望した時だけ）作業フォルダ名ごとの発言数と、呼んだスキル・エージェント・MCP の名前。希望しない時は名前を元に戻せない記号にして、種類の数だけ分かるようにする | |
 
 - 数字は **手元の Claude Code のログ**（`~/.claude/projects/`）から数えます
 - **インターネットには何も送りません**。書き込む先は、手元の設定ファイル（`~/.claude-usage-check/config.json`）と、利用者が指定した同期フォルダだけです
@@ -37,7 +39,7 @@
 > Claude Code の使用量を月に1回集めます。会話の中身は集めません（数字だけです）。
 > 1. 共有フォルダ「〇〇」があなたの PC で見えることを確認してください（Google ドライブのパソコン版）
 > 2. Claude Code を開いて、次の文を貼ってください:
->    `https://github.com/yujirotn/claude-usage-check/blob/v0.3.0/CLAUDE.md を読んで、使用量を送って。格納先は共有フォルダ「〇〇」`
+>    `https://github.com/yujirotn/claude-usage-check/blob/v0.4.0/CLAUDE.md を読んで、使用量を送って。格納先は共有フォルダ「〇〇」`
 > 3. 毎月最終営業日に、同じ文を貼ってください
 
 ## メンバーがやること
@@ -45,13 +47,13 @@
 Claude Code に次の文を貼るだけです。初回だけ、名前と格納先を聞かれます。
 
 ```
-https://github.com/yujirotn/claude-usage-check/blob/v0.3.0/CLAUDE.md を読んで、使用量を送って
+https://github.com/yujirotn/claude-usage-check/blob/v0.4.0/CLAUDE.md を読んで、使用量を送って
 ```
 
 ## 手で実行する場合
 
 ```bash
-git clone https://github.com/yujirotn/claude-usage-check && cd claude-usage-check && git checkout v0.3.0
+git clone https://github.com/yujirotn/claude-usage-check && cd claude-usage-check && git checkout v0.4.0
 python3 usage_check.py find-drives                              # 同期フォルダの候補
 python3 usage_check.py setup --name "山田" --dest "<共有フォルダ>"  # 初回だけ
 python3 usage_check.py retention --days 90                      # 初回だけ・任意（下の注意）
@@ -73,6 +75,7 @@ Windows では `python3` を `py` に読み替えてください。
 
 配る時は版（タグ）を固定した URL を案内してください。版を上げる時は、ここに変更点を書いてからタグを付けます。
 
+- v0.4.0（2026-11-20）: スキル・エージェント・MCP・コマンドの呼び出し回数と、入っているスキル・エージェント・プラグインの数を追加（レポートの段と `export` の表 `tools`・`tool_names`）
 - v0.3.0（2026-11-20）: `--yen <1ドルの円>` で金額を円で出せるようにした（collect・report・export）。`export` に日別・モデル別の表を追加
 - v0.2.0（2026-11-20）: `export` を追加（月別・フォルダ別の表を CSV か JSON で出す。スプシに貼る用）。期間を指定したレポートはファイル名に期間が入る
 - v0.1.0（2026-11-20）: 最初の版。Claude Code の使用量の集計・共有フォルダへの格納・PDF レポート

@@ -14,6 +14,7 @@ Python 3.9 以上・標準ライブラリだけで動く。
 import argparse
 import csv
 import glob
+import hashlib
 import html
 import json
 import os
@@ -26,7 +27,7 @@ import tempfile
 from collections import defaultdict
 from datetime import date, datetime
 
-TOOL_VERSION = "0.3.0"
+TOOL_VERSION = "0.4.0"
 SCHEMA = 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".claude-usage-check")
@@ -70,6 +71,8 @@ def write_json_atomic(path, data, mode=0o644, sort_keys=True, indent=1):
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9._:\-]{1,80}$")
+INV_KEYS = ("skills_user", "agents_user", "skills_project", "agents_project", "skills_plugin",
+            "agents_plugin", "skills_synced", "plugins", "projects_scanned")
 TOKEN_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "responses")
 
 
@@ -116,6 +119,22 @@ def validate_member(d):
             models[mn] = dict({k: t.get(k, 0) for k in TOKEN_KEYS}, cost_usd=c)
         item = {"sessions": r.get("sessions", 0), "prompts": r.get("prompts", 0),
                 "responses": r.get("responses", 0), "cost_usd": r.get("cost_usd", 0), "models": models}
+        tools_in = r.get("tools")
+        if tools_in is not None:
+            if not isinstance(tools_in, dict):
+                return None, "道具の内訳の形が違う"
+            tools = {}
+            for kind, names in tools_in.items():
+                if kind not in TOOL_KINDS or not isinstance(names, dict):
+                    return None, "道具の内訳の形が違う"
+                out = {}
+                for k, v in names.items():
+                    name = clean_text(k, 80)
+                    if not name or not _int(v):
+                        return None, "道具の内訳の形が違う"
+                    out[name] = v
+                tools[kind] = out
+            item["tools"] = tools
         for key in ("entrypoints", "projects"):
             src = r.get(key)
             if src is None:
@@ -130,12 +149,25 @@ def validate_member(d):
                 out[name] = v
             item[key] = out
         days[day] = item
+    inv = None
+    if d.get("inventory") is not None:
+        src = d["inventory"]
+        if not isinstance(src, dict):
+            return None, "入っている数の形が違う"
+        inv = {}
+        for k in INV_KEYS:
+            v = src.get(k, 0)
+            if not _int(v):
+                return None, "入っている数の形が違う"
+            inv[k] = v
+        a = src.get("as_of")
+        inv["as_of"] = a if isinstance(a, str) and DATE_RE.match(a) else ""
     as_of = d.get("prices_as_of")
     updated = d.get("updated_at")
     return {"schema": SCHEMA, "member": member, "days": days,
             "prices_as_of": as_of if isinstance(as_of, str) and DATE_RE.match(as_of) else "?",
             "updated_at": updated[:25] if isinstance(updated, str) and DATE_RE.match(updated[:10]) else "",
-            "tool_version": clean_text(d.get("tool_version"), 20) or ""}, None
+            "tool_version": clean_text(d.get("tool_version"), 20) or "", "inventory": inv}, None
 
 
 def safe_filename(name):
@@ -196,8 +228,11 @@ def collect_days(include_projects):
         "sessions": set(), "prompts": 0, "responses": 0,
         "models": defaultdict(lambda: dict(empty_tokens(), responses=0)),
         "entrypoints": defaultdict(int), "projects": defaultdict(int),
+        "tools": {k: defaultdict(int) for k in TOOL_KINDS},
     })
     seen = set()
+    seen_tools = set()
+    cwds = set()  # 入っている数を数えるための作業フォルダ（外には出さない）
     first_day = {}  # セッションは始まった日に1回だけ数える
     for path in files:
         try:
@@ -223,11 +258,16 @@ def collect_days(include_projects):
                 if sid and not side and (sid not in first_day or day < first_day[sid]):
                     first_day[sid] = day
                 msg = d.get("message") or {}
+                if d.get("cwd"):
+                    cwds.add(d["cwd"])
                 if t == "user":
                     # 人が打った発言だけ数える（ツール結果・自動挿入・サブエージェントは除く）
                     if side or d.get("isMeta") or not isinstance(msg.get("content"), str):
                         continue
                     rec["prompts"] += 1
+                    cm = re.search(r"<command-name>/?([^<]{1,80})</command-name>", msg["content"])
+                    if cm:
+                        rec["tools"]["command"][tool_name(cm.group(1).strip(), include_projects)] += 1
                     rec["entrypoints"][d.get("entrypoint") or "unknown"] += 1
                     if include_projects and d.get("cwd"):
                         rec["projects"][os.path.basename(d["cwd"].rstrip("/\\")) or d["cwd"]] += 1
@@ -237,6 +277,14 @@ def collect_days(include_projects):
                     continue
                 if not re.match(r"^claude-[a-z0-9.\-]{1,60}$", model):
                     model = "other"  # Bedrock の ARN など、口座番号が入りうる名前は出さない
+                for b in msg.get("content") or []:
+                    # 1つの応答が複数行に分かれて記録されるので、道具の呼び出しは呼び出しの ID で重複を除く
+                    if not isinstance(b, dict) or b.get("type") != "tool_use" or b.get("id") in seen_tools:
+                        continue
+                    seen_tools.add(b.get("id"))
+                    kind, name = classify_tool(b.get("name") or "", b.get("input") or {})
+                    if kind:
+                        rec["tools"][kind][tool_name(name, include_projects)] += 1
                 key = (msg.get("id"), d.get("requestId"))
                 if key != (None, None):
                     if key in seen:
@@ -280,8 +328,110 @@ def collect_days(include_projects):
             item["unpriced_models"] = sorted(unknown)
         if include_projects:
             item["projects"] = dict(rec["projects"])
+        tools = {k: dict(v) for k, v in rec["tools"].items() if v}
+        if tools:
+            item["tools"] = tools
         out[day] = item
-    return out, len(files), prices.as_of
+    return out, len(files), prices.as_of, cwds
+
+
+TOOL_KINDS = ("skill", "agent", "mcp", "command")
+TOOL_LABELS = {"skill": "スキル", "agent": "エージェント", "mcp": "MCP", "command": "コマンド"}
+
+
+def classify_tool(name, inp):
+    if name == "Skill":
+        return "skill", str(inp.get("skill") or "?")
+    if name in ("Agent", "Task"):
+        return "agent", str(inp.get("subagent_type") or "general-purpose")
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        return "mcp", parts[1] if len(parts) > 2 else name
+    return None, None
+
+
+def tool_name(name, plain):
+    """名前のまま出すか、元に戻せない記号にするか。記号でも「何種類か」は数えられる。"""
+    name = re.sub(r"[\x00-\x1f<>]", "", name)[:80] or "?"
+    if plain:
+        return name
+    return "#" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:10]
+
+
+def count_dir_items(root):
+    skills = len(glob.glob(os.path.join(root, "skills", "*", "SKILL.md")))
+    agents = len(glob.glob(os.path.join(root, "agents", "*.md")))
+    return skills, agents
+
+
+def project_roots(cwds):
+    """作業フォルダから、.claude フォルダを持つ一番近い上位のフォルダを探す（ホームより上は見ない）。"""
+    home = os.path.realpath(os.path.expanduser("~"))
+    roots = set()
+    for c in cwds:
+        cur = os.path.realpath(c)
+        while cur.startswith(home) and cur != home:
+            if os.path.isdir(os.path.join(cur, ".claude")):
+                roots.add(cur)
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    return roots
+
+
+def inventory(cwds):
+    """入っているスキル・エージェント・プラグインの数（名前は出さない）。"""
+    cd = claude_dir()
+    inv = {"skills_user": 0, "agents_user": 0, "skills_project": 0, "agents_project": 0,
+           "skills_plugin": 0, "agents_plugin": 0, "skills_synced": 0, "plugins": 0}
+    inv["skills_user"], inv["agents_user"] = count_dir_items(cd)
+    roots = project_roots(cwds)
+    for r in roots:
+        s_, a_ = count_dir_items(os.path.join(r, ".claude"))
+        inv["skills_project"] += s_
+        inv["agents_project"] += a_
+    # 有効なプラグイン: 設定の enabledPlugins と、CLI で入れたもの
+    markets = load_json(os.path.join(cd, "plugins", "known_marketplaces.json"), {}) or {}
+    enabled = set()
+    for f in [os.path.join(cd, "settings.json")] + [os.path.join(r, ".claude", n) for r in roots
+                                                     for n in ("settings.json", "settings.local.json")]:
+        d = load_json(f, {}) or {}
+        ep = d.get("enabledPlugins") if isinstance(d, dict) else None
+        if isinstance(ep, dict):
+            enabled.update(k for k, v in ep.items() if v is True and isinstance(k, str))
+    dirs = set()
+    for key in enabled:
+        name, _, market = key.partition("@")
+        loc = (markets.get(market) or {}).get("installLocation") if isinstance(markets.get(market), dict) else None
+        for cand in ([os.path.join(loc, "plugins", name), os.path.join(loc, name)] if loc else []):
+            if os.path.isdir(cand):
+                dirs.add(os.path.realpath(cand))
+                break
+    inst = load_json(os.path.join(cd, "plugins", "installed_plugins.json"), {}) or {}
+    for key, entries in ((inst.get("plugins") or {}) if isinstance(inst, dict) else {}).items():
+        for e in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(e, dict) or not e.get("installPath"):
+                continue
+            pp = e.get("projectPath")
+            if e.get("scope") in ("local", "project") and pp and os.path.realpath(pp) not in roots:
+                continue
+            if key in enabled or e.get("scope") == "user":
+                dirs.add(os.path.realpath(e["installPath"]))
+    inv["plugins"] = len(dirs)
+    for pd in dirs:
+        inv["skills_plugin"] += len(glob.glob(os.path.join(pd, "skills", "*", "SKILL.md")))
+        inv["agents_plugin"] += len(glob.glob(os.path.join(pd, "agents", "*.md")))
+    synced = set()  # claude.ai から同期したもの。同じプラグインの古い版（~g1, ~g2 …）が重なるので名前で重複を除く
+    for f in glob.glob(os.path.join(cd, "plugins", "synced", "**", "SKILL.md"), recursive=True):
+        parts = os.path.relpath(f, os.path.join(cd, "plugins", "synced")).split(os.sep)
+        plugin = re.sub(r"~g\d+$", "", parts[-4]) if len(parts) >= 4 else ""
+        synced.add((plugin, parts[-2]))
+    inv["skills_synced"] = len(synced)
+    inv["projects_scanned"] = len(roots)
+    inv["as_of"] = date.today().isoformat()
+    return inv
 
 
 # ---------------------------------------------------------------- コマンド
@@ -365,7 +515,8 @@ def cmd_collect(a):
     cfg = load_json(CONFIG_PATH)
     if not cfg:
         die("まだ設定されていません。先に setup を実行してください。")
-    days, nfiles, as_of = collect_days(cfg.get("include_projects", False))
+    days, nfiles, as_of, cwds = collect_days(cfg.get("include_projects", False))
+    inv = inventory(cwds)
     if not days:
         die("Claude Code のログが見つかりませんでした: " + os.path.join(claude_dir(), "projects"))
     out_path = os.path.join(cfg["dest"], SUBDIR, safe_filename(cfg["name"]) + ".json")
@@ -381,10 +532,13 @@ def cmd_collect(a):
     merged.update(days)  # 同じ日は新しい数字で上書き。ログが消えた古い日は残す
     data = {"schema": SCHEMA, "tool_version": TOOL_VERSION, "member": cfg["name"],
             "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "prices_as_of": as_of, "days": dict(sorted(merged.items()))}
+            "prices_as_of": as_of, "inventory": inv, "days": dict(sorted(merged.items()))}
     tot = summarize({cfg["name"]: data}, None, None)
     print("読んだログ: %d ファイル / 期間: %s 〜 %s" % (nfiles, min(days), max(days)))
     print_summary(tot)
+    print("  入っている数: スキル %d（個人 %d・プロジェクト %d・プラグイン %d・同期 %d）／エージェント %d／プラグイン %d" % (
+        inv_total(inv, "skills"), inv["skills_user"], inv["skills_project"], inv["skills_plugin"], inv["skills_synced"],
+        inv_total(inv, "agents"), inv["plugins"]))
     if a.dry_run:
         print("（--dry-run なので書き込んでいません）")
         return
@@ -394,10 +548,17 @@ def cmd_collect(a):
 
 # ---------------------------------------------------------------- 集計とレポート
 
+def inv_total(inv, what):
+    if what == "skills":
+        return inv["skills_user"] + inv["skills_project"] + inv["skills_plugin"] + inv["skills_synced"]
+    return inv["agents_user"] + inv["agents_project"] + inv["agents_plugin"]
+
+
 def summarize(members, d_from, d_to):
     per_member, per_day = {}, defaultdict(lambda: defaultdict(int))
     per_model = defaultdict(lambda: defaultdict(float))
     total = defaultdict(float)
+    tool_names = defaultdict(lambda: {"calls": 0, "users": set()})
     for name, data in members.items():
         m = defaultdict(float)
         active = 0
@@ -409,6 +570,13 @@ def summarize(members, d_from, d_to):
             for k in ("sessions", "prompts", "responses", "cost_usd"):
                 m[k] += r.get(k, 0) or 0
                 total[k] += r.get(k, 0) or 0
+            for kind, names in (r.get("tools") or {}).items():
+                for n, c in names.items():
+                    m["calls_" + kind] += c
+                    total["calls_" + kind] += c
+                    t = tool_names[(kind, n)]
+                    t["calls"] += c
+                    t["users"].add(name)
             per_day[day]["prompts"] += r.get("prompts", 0)
             per_day[day]["sessions"] += r.get("sessions", 0)
             for mn, t in (r.get("models") or {}).items():
@@ -421,9 +589,11 @@ def summarize(members, d_from, d_to):
                 per_model[mn]["cost_usd"] += t.get("cost_usd") or 0
         m["active_days"] = active
         m["updated_at"] = data.get("updated_at", "")
+        m["inventory"] = data.get("inventory")
         per_member[name] = m
     return {"members": per_member, "days": dict(sorted(per_day.items())),
-            "models": dict(per_model), "total": dict(total)}
+            "models": dict(per_model), "total": dict(total),
+            "tools": {k: {"calls": v["calls"], "users": len(v["users"])} for k, v in tool_names.items()}}
 
 
 def fmt_int(n):
@@ -439,9 +609,12 @@ def fmt_tok(n):
 
 def print_summary(s):
     t = s["total"]
+    tools_line = "  スキル %s 回 / エージェント %s 回 / MCP %s 回 / コマンド %s 回" % tuple(
+        fmt_int(t.get("calls_" + k, 0)) for k in TOOL_KINDS)
     print("  セッション %s / 人の発言 %s / AIの応答 %s / トークン %s / API換算 %s" % (
         fmt_int(t.get("sessions", 0)), fmt_int(t.get("prompts", 0)), fmt_int(t.get("responses", 0)),
         fmt_tok(t.get("tokens", 0)), fmt_money(t.get("cost_usd", 0))))
+    print(tools_line)
 
 
 def bar_chart_svg(days):
@@ -480,6 +653,20 @@ def render_html(org, s, d_from, d_to, as_of):
         "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
             html.escape(k), fmt_int(v["responses"]), fmt_tok(v["tokens"]), html.escape(fmt_money(v["cost_usd"])))
         for k, v in sorted(s["models"].items(), key=lambda x: -x[1]["tokens"]))
+    def inv_cell(m, what):
+        inv = m.get("inventory")
+        return fmt_int(inv_total(inv, what)) if inv else "-"
+    trows = "".join(
+        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            html.escape(name), fmt_int(m["calls_skill"]), fmt_int(m["calls_agent"]), fmt_int(m["calls_mcp"]),
+            fmt_int(m["calls_command"]), inv_cell(m, "skills"), inv_cell(m, "agents"))
+        for name, m in sorted(s["members"].items(), key=lambda x: -(x[1]["calls_skill"] + x[1]["calls_agent"])))
+    top = sorted(s["tools"].items(), key=lambda x: -x[1]["calls"])[:15]
+    toprows = "".join(
+        "<tr><td>%s</td><td class='l'>%s</td><td>%s</td><td>%s</td></tr>" % (
+            TOOL_LABELS[k[0]], html.escape("（名前は非公開）" if k[1].startswith("#") else k[1]),
+            fmt_int(v["calls"]), fmt_int(v["users"]))
+        for k, v in top) or "<tr><td colspan='4' class='mute'>記録なし</td></tr>"
     kpi = [("利用者", "%d / %d 人" % (active, n)), ("セッション", fmt_int(t.get("sessions", 0))),
            ("人の発言", fmt_int(t.get("prompts", 0))), ("トークン", fmt_tok(t.get("tokens", 0))),
            ("API換算", fmt_money(t.get("cost_usd", 0)))]
@@ -498,7 +685,7 @@ h1{font-size:22px;margin:0}h2{font-size:15px;margin:28px 0 8px;border-left:4px s
 .kpi{border:1px solid var(--line);border-radius:8px;padding:10px}.k{color:var(--mute);font-size:11px}.v{font-size:18px;font-weight:700}
 table{width:100%%;border-collapse:collapse}th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:right}
 th:first-child,td:first-child{text-align:left}th{font-size:11px;color:var(--mute);font-weight:600}
-.mute{color:var(--mute)}.bar{fill:var(--accent)}.ax{font-size:10px;fill:var(--mute)}.base{stroke:var(--line)}
+.mute{color:var(--mute)}th.l,td.l{text-align:left}.bar{fill:var(--accent)}.ax{font-size:10px;fill:var(--mute)}.base{stroke:var(--line)}
 .note{color:var(--mute);font-size:11px;margin-top:24px;line-height:1.7}
 @page{size:A4;margin:12mm}
 </style></head><body><div class="page">
@@ -510,14 +697,19 @@ th:first-child,td:first-child{text-align:left}th{font-size:11px;color:var(--mute
 <table><tr><th>名前</th><th>使った日数</th><th>セッション</th><th>人の発言</th><th>トークン</th><th>API換算</th><th>最終送信</th></tr>%s</table>
 <h2>モデル別</h2>
 <table><tr><th>モデル</th><th>AIの応答</th><th>トークン</th><th>API換算</th></tr>%s</table>
+<h2>スキル・エージェントの活用（メンバー別）</h2>
+<table><tr><th>名前</th><th>スキル</th><th>エージェント</th><th>MCP</th><th>コマンド</th><th>入っているスキル</th><th>入っているエージェント</th></tr>%s</table>
+<h2>よく使われた道具（上位15）</h2>
+<table><tr><th>種類</th><th class='l'>名前</th><th>回数</th><th>使った人数</th></tr>%s</table>
 <div class="note">
 ・対象は Claude Code のみ（claude.ai のチャットは含まない）。会話の中身は集めていない。<br>
 ・「人の発言」は利用者が入力した回数。「AIの応答」にはサブエージェントの応答も含む。<br>
+・スキル・エージェント・MCP・コマンドは呼び出した回数。「入っている」は各自が最後に送った時点の数（個人・よく作業するフォルダ・有効なプラグイン・claude.ai から同期したものの合計）。<br>
 ・「API換算」は Anthropic API の公開単価（%s 時点）で計算した目安で、定額プランの実際の支払額ではない。%s<br>
 ・各メンバーの PC に残っているログ（既定では30日）から数えている。送信していない期間は空白になる。
 </div></div></body></html>""" % (
         html.escape(org), html.escape(period), date.today().isoformat(), kpis, bar_chart_svg(s["days"]),
-        rows, mrows, html.escape(as_of), ("円は 1ドル＝%s円 で固定して換算。" % fmt_int(YEN)) if YEN else "")
+        rows, mrows, trows, toprows, html.escape(as_of), ("円は 1ドル＝%s円 で固定して換算。" % fmt_int(YEN)) if YEN else "")
 
 
 def find_browser():
@@ -618,6 +810,8 @@ def export_rows(members, d_from, d_to):
     projects = defaultdict(int)
     daily = defaultdict(lambda: defaultdict(float))
     models = defaultdict(lambda: defaultdict(float))
+    tool_month = defaultdict(lambda: {"calls": defaultdict(int), "names": defaultdict(set)})
+    tool_names = defaultdict(lambda: {"calls": 0, "users": set()})
     for name, data in members.items():
         for day, r in data["days"].items():
             if (d_from and day < d_from) or (d_to and day > d_to):
@@ -639,6 +833,14 @@ def export_rows(members, d_from, d_to):
                 mm["output"] += t["output"]
                 mm["cost_usd"] += t["cost_usd"] or 0
             m["updated_at"] = data.get("updated_at", "")[:10]
+            tm = tool_month[(day[:7], name)]
+            for kind, names in (r.get("tools") or {}).items():
+                for tn, c in names.items():
+                    tm["calls"][kind] += c
+                    tm["names"][kind].add(tn)
+                    tt = tool_names[(day[:7], kind, tn)]
+                    tt["calls"] += c
+                    tt["users"].add(name)
             for pj, n in (r.get("projects") or {}).items():
                 projects[(day[:7], name, pj)] += n
     head_m = ["月", "名前", "使った日数", "セッション", "人の発言", "AIの応答", "トークン", "API換算(USD)", "最終送信日"]
@@ -654,7 +856,19 @@ def export_rows(members, d_from, d_to):
     head_o = ["月", "名前", "モデル", "AIの応答", "トークン", "出力トークン", "API換算(USD)"]
     rows_o = [[mon, sheet_safe(name), mn, int(v["responses"]), int(v["tokens"]), int(v["output"]),
                round(v["cost_usd"], 2)] for (mon, name, mn), v in sorted(models.items())]
+    head_t = ["月", "名前", "スキル呼び出し", "使ったスキルの種類", "エージェント呼び出し", "使ったエージェントの種類",
+              "MCP呼び出し", "使ったMCPの種類", "コマンド", "入っているスキル", "入っているエージェント", "プラグイン"]
+    rows_t = []
+    for (mon, name), v in sorted(tool_month.items()):
+        inv = members[name].get("inventory")
+        rows_t.append([mon, sheet_safe(name)] + [x for k in ("skill", "agent", "mcp") for x in
+                       (int(v["calls"][k]), len(v["names"][k]))] + [int(v["calls"]["command"])] +
+                      ([inv_total(inv, "skills"), inv_total(inv, "agents"), inv["plugins"]] if inv else ["", "", ""]))
+    head_n = ["月", "種類", "名前", "回数", "使った人数"]
+    rows_n = [[mon, TOOL_LABELS[kind], sheet_safe("（名前は非公開）" if n.startswith("#") else n), v["calls"], len(v["users"])]
+              for (mon, kind, n), v in sorted(tool_names.items(), key=lambda x: (x[0][0], -x[1]["calls"]))]
     tables = {"monthly": [head_m] + rows_m, "daily": [head_d] + rows_d,
+              "tools": [head_t] + rows_t, "tool_names": [head_n] + rows_n,
               "models": [head_o] + rows_o, "projects": [head_p] + rows_p}
     if YEN:  # 円の列を足す（API換算の USD 列のすぐ後ろ）
         for key in ("monthly", "daily", "models"):
