@@ -26,12 +26,19 @@ import tempfile
 from collections import defaultdict
 from datetime import date, datetime
 
-TOOL_VERSION = "0.2.0"
+TOOL_VERSION = "0.3.0"
 SCHEMA = 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".claude-usage-check")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 SUBDIR = "claude-usage"  # 格納先の中に作るフォルダ
+YEN = None  # --yen で 1ドルあたりの円を渡すと、金額を円で表示する
+
+
+def fmt_money(usd):
+    if YEN:
+        return "¥{:,}".format(int(round((usd or 0) * YEN)))
+    return "${:,.2f}".format(usd or 0)
 
 
 # ---------------------------------------------------------------- 共通
@@ -432,9 +439,9 @@ def fmt_tok(n):
 
 def print_summary(s):
     t = s["total"]
-    print("  セッション %s / 人の発言 %s / AIの応答 %s / トークン %s / API換算 $%.2f" % (
+    print("  セッション %s / 人の発言 %s / AIの応答 %s / トークン %s / API換算 %s" % (
         fmt_int(t.get("sessions", 0)), fmt_int(t.get("prompts", 0)), fmt_int(t.get("responses", 0)),
-        fmt_tok(t.get("tokens", 0)), t.get("cost_usd", 0)))
+        fmt_tok(t.get("tokens", 0)), fmt_money(t.get("cost_usd", 0))))
 
 
 def bar_chart_svg(days):
@@ -465,17 +472,17 @@ def render_html(org, s, d_from, d_to, as_of):
     active = sum(1 for m in s["members"].values() if m["prompts"] > 0)
     period = "%s 〜 %s" % (d_from or (min(s["days"]) if s["days"] else "-"), d_to or (max(s["days"]) if s["days"] else "-"))
     rows = "".join(
-        "<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>$%s</td><td class='mute'>%s</td></tr>" % (
+        "<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class='mute'>%s</td></tr>" % (
             html.escape(name), m["active_days"], fmt_int(m["sessions"]), fmt_int(m["prompts"]),
-            fmt_tok(m["tokens"]), "{:,.2f}".format(m["cost_usd"]), html.escape(m["updated_at"][:10]))
+            fmt_tok(m["tokens"]), html.escape(fmt_money(m["cost_usd"])), html.escape(m["updated_at"][:10]))
         for name, m in sorted(s["members"].items(), key=lambda x: -x[1]["prompts"]))
     mrows = "".join(
-        "<tr><td>%s</td><td>%s</td><td>%s</td><td>$%s</td></tr>" % (
-            html.escape(k), fmt_int(v["responses"]), fmt_tok(v["tokens"]), "{:,.2f}".format(v["cost_usd"]))
+        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            html.escape(k), fmt_int(v["responses"]), fmt_tok(v["tokens"]), html.escape(fmt_money(v["cost_usd"])))
         for k, v in sorted(s["models"].items(), key=lambda x: -x[1]["tokens"]))
     kpi = [("利用者", "%d / %d 人" % (active, n)), ("セッション", fmt_int(t.get("sessions", 0))),
            ("人の発言", fmt_int(t.get("prompts", 0))), ("トークン", fmt_tok(t.get("tokens", 0))),
-           ("API換算", "$%s" % fmt_int(t.get("cost_usd", 0)))]
+           ("API換算", fmt_money(t.get("cost_usd", 0)))]
     kpis = "".join('<div class="kpi"><div class="k">%s</div><div class="v">%s</div></div>'
                    % (html.escape(k), html.escape(v)) for k, v in kpi)
     return """<!doctype html><html lang="ja"><head><meta charset="utf-8">
@@ -506,11 +513,11 @@ th:first-child,td:first-child{text-align:left}th{font-size:11px;color:var(--mute
 <div class="note">
 ・対象は Claude Code のみ（claude.ai のチャットは含まない）。会話の中身は集めていない。<br>
 ・「人の発言」は利用者が入力した回数。「AIの応答」にはサブエージェントの応答も含む。<br>
-・「API換算」は Anthropic API の公開単価（%s 時点）で計算した目安で、定額プランの実際の支払額ではない。<br>
+・「API換算」は Anthropic API の公開単価（%s 時点）で計算した目安で、定額プランの実際の支払額ではない。%s<br>
 ・各メンバーの PC に残っているログ（既定では30日）から数えている。送信していない期間は空白になる。
 </div></div></body></html>""" % (
         html.escape(org), html.escape(period), date.today().isoformat(), kpis, bar_chart_svg(s["days"]),
-        rows, mrows, html.escape(as_of))
+        rows, mrows, html.escape(as_of), ("円は 1ドル＝%s円 で固定して換算。" % fmt_int(YEN)) if YEN else "")
 
 
 def find_browser():
@@ -609,6 +616,8 @@ def sheet_safe(v):
 def export_rows(members, d_from, d_to):
     monthly = defaultdict(lambda: defaultdict(float))
     projects = defaultdict(int)
+    daily = defaultdict(lambda: defaultdict(float))
+    models = defaultdict(lambda: defaultdict(float))
     for name, data in members.items():
         for day, r in data["days"].items():
             if (d_from and day < d_from) or (d_to and day > d_to):
@@ -617,8 +626,18 @@ def export_rows(members, d_from, d_to):
             m["active_days"] += 1 if r["prompts"] > 0 else 0
             for k in ("sessions", "prompts", "responses", "cost_usd"):
                 m[k] += r[k]
-            for t in r["models"].values():
-                m["tokens"] += sum(t[k] for k in TOKEN_KEYS if k != "responses")
+            dd = daily[(day, name)]
+            for k in ("sessions", "prompts", "responses", "cost_usd"):
+                dd[k] += r[k]
+            for mn, t in r["models"].items():
+                toks = sum(t[k] for k in TOKEN_KEYS if k != "responses")
+                m["tokens"] += toks
+                dd["tokens"] += toks
+                mm = models[(day[:7], name, mn)]
+                mm["responses"] += t["responses"]
+                mm["tokens"] += toks
+                mm["output"] += t["output"]
+                mm["cost_usd"] += t["cost_usd"] or 0
             m["updated_at"] = data.get("updated_at", "")[:10]
             for pj, n in (r.get("projects") or {}).items():
                 projects[(day[:7], name, pj)] += n
@@ -629,18 +648,33 @@ def export_rows(members, d_from, d_to):
     head_p = ["月", "名前", "フォルダ", "人の発言"]
     rows_p = [[mon, sheet_safe(name), sheet_safe(pj), n]
               for (mon, name, pj), n in sorted(projects.items(), key=lambda x: (x[0][0], x[0][1], -x[1]))]
-    return [head_m] + rows_m, [head_p] + rows_p
+    head_d = ["日付", "名前", "セッション", "人の発言", "AIの応答", "トークン", "API換算(USD)"]
+    rows_d = [[day, sheet_safe(name), int(v["sessions"]), int(v["prompts"]), int(v["responses"]),
+               int(v["tokens"]), round(v["cost_usd"], 2)] for (day, name), v in sorted(daily.items())]
+    head_o = ["月", "名前", "モデル", "AIの応答", "トークン", "出力トークン", "API換算(USD)"]
+    rows_o = [[mon, sheet_safe(name), mn, int(v["responses"]), int(v["tokens"]), int(v["output"]),
+               round(v["cost_usd"], 2)] for (mon, name, mn), v in sorted(models.items())]
+    tables = {"monthly": [head_m] + rows_m, "daily": [head_d] + rows_d,
+              "models": [head_o] + rows_o, "projects": [head_p] + rows_p}
+    if YEN:  # 円の列を足す（API換算の USD 列のすぐ後ろ）
+        for key in ("monthly", "daily", "models"):
+            t = tables[key]
+            i = t[0].index("API換算(USD)")
+            t[0].insert(i + 1, "API換算(円・1ドル%s円)" % fmt_int(YEN))
+            for row in t[1:]:
+                row.insert(i + 1, int(round(row[i] * YEN)))
+    return tables
 
 
 def cmd_export(a):
     folder, members = load_members(a)
-    monthly, projects = export_rows(members, a.date_from, a.date_to)
+    tables = export_rows(members, a.date_from, a.date_to)
     if a.json:
-        json.dump({"monthly": monthly, "projects": projects}, sys.stdout, ensure_ascii=False)
+        json.dump(tables, sys.stdout, ensure_ascii=False)
         return
     out_dir = os.path.join(folder, "reports")
     os.makedirs(out_dir, exist_ok=True)
-    for name, rows in (("monthly", monthly), ("projects", projects)):
+    for name, rows in tables.items():
         path = os.path.join(out_dir, "%s_%s.csv" % (period_stem(a), name))
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             csv.writer(f).writerows(rows)
@@ -674,7 +708,15 @@ def main():
     p.add_argument("--to", dest="date_to")
     p.add_argument("--json", action="store_true", help="CSV を書かずに標準出力へ JSON で出す")
     p.set_defaults(fn=cmd_export)
+    for sub in sp.choices.values():
+        if sub.prog.split()[-1] in ("collect", "report", "export"):
+            sub.add_argument("--yen", type=float, help="金額を円で出す（1ドルあたりの円。例 150）")
     a = ap.parse_args()
+    global YEN
+    if getattr(a, "yen", None):
+        if not 1 <= a.yen <= 1000:
+            die("--yen は 1〜1000 の数で指定してください")
+        YEN = a.yen
     a.fn(a)
 
 

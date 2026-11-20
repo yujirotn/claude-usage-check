@@ -29,14 +29,15 @@
    python3 usage_check.py report --dest "<共有フォルダ>" --org "会社名" --from 2026-11-01 --to 2026-11-30
    ```
    共有フォルダの `claude-usage/reports/` に HTML と PDF ができます（PDF の書き出しには Chrome か Edge が要ります）
-4. **スプシで見たい場合**は `python3 usage_check.py export --dest "<共有フォルダ>" --from ... --to ...` で月別・フォルダ別の CSV が同じ場所にできます（数式として動く文字は無害化済み）
+4. 金額を円で見たい場合は `--yen 150` のように 1ドルあたりの円を付けます（report・export）
+5. **スプシで見たい場合**は `python3 usage_check.py export --dest "<共有フォルダ>" --from ... --to ...` で月別・フォルダ別の CSV が同じ場所にできます（数式として動く文字は無害化済み）
 
 ### メンバーへの案内文（ひな形）
 
 > Claude Code の使用量を月に1回集めます。会話の中身は集めません（数字だけです）。
 > 1. 共有フォルダ「〇〇」があなたの PC で見えることを確認してください（Google ドライブのパソコン版）
 > 2. Claude Code を開いて、次の文を貼ってください:
->    `https://github.com/yujirotn/claude-usage-check/blob/v0.2.0/CLAUDE.md を読んで、使用量を送って。格納先は共有フォルダ「〇〇」`
+>    `https://github.com/yujirotn/claude-usage-check/blob/v0.3.0/CLAUDE.md を読んで、使用量を送って。格納先は共有フォルダ「〇〇」`
 > 3. 毎月最終営業日に、同じ文を貼ってください
 
 ## メンバーがやること
@@ -44,13 +45,13 @@
 Claude Code に次の文を貼るだけです。初回だけ、名前と格納先を聞かれます。
 
 ```
-https://github.com/yujirotn/claude-usage-check/blob/v0.2.0/CLAUDE.md を読んで、使用量を送って
+https://github.com/yujirotn/claude-usage-check/blob/v0.3.0/CLAUDE.md を読んで、使用量を送って
 ```
 
 ## 手で実行する場合
 
 ```bash
-git clone https://github.com/yujirotn/claude-usage-check && cd claude-usage-check && git checkout v0.2.0
+git clone https://github.com/yujirotn/claude-usage-check && cd claude-usage-check && git checkout v0.3.0
 python3 usage_check.py find-drives                              # 同期フォルダの候補
 python3 usage_check.py setup --name "山田" --dest "<共有フォルダ>"  # 初回だけ
 python3 usage_check.py retention --days 90                      # 初回だけ・任意（下の注意）
@@ -72,6 +73,7 @@ Windows では `python3` を `py` に読み替えてください。
 
 配る時は版（タグ）を固定した URL を案内してください。版を上げる時は、ここに変更点を書いてからタグを付けます。
 
+- v0.3.0（2026-11-20）: `--yen <1ドルの円>` で金額を円で出せるようにした（collect・report・export）。`export` に日別・モデル別の表を追加
 - v0.2.0（2026-11-20）: `export` を追加（月別・フォルダ別の表を CSV か JSON で出す。スプシに貼る用）。期間を指定したレポートはファイル名に期間が入る
 - v0.1.0（2026-11-20）: 最初の版。Claude Code の使用量の集計・共有フォルダへの格納・PDF レポート
 
